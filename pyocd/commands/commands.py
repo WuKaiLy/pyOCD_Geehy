@@ -55,6 +55,7 @@ from .base import CommandBase
 
 if TYPE_CHECKING:
     from ..core.core_target import CoreTarget
+    from ..core.session import Session
 
 # Make disasm optional.
 try:
@@ -64,6 +65,31 @@ except ImportError:
     IS_CAPSTONE_AVAILABLE = False
 
 LOG = logging.getLogger(__name__)
+
+
+def _reset_before_flash_commander(session: "Session") -> None:
+    """Optional reset-and-halt before commander flash load or erase.
+
+    Mirrors ``pyocd load`` and session option ``load.pre_reset`` (use ``off`` to skip).
+    The ``pyocd erase`` CLI always resets and ignores ``load.pre_reset``.
+    """
+    secondary_cores = [c for c in session.target.cores.values() if c != session.target.primary_core]
+    pre_reset = session.options.get('load.pre_reset')
+    if pre_reset == "off":
+        return
+    try:
+        reset_type = convert_reset_type(pre_reset) if pre_reset else None
+    except ValueError as err:
+        raise exceptions.CommandError(f"invalid load.pre_reset option: {pre_reset}") from err
+
+    try:
+        for core in secondary_cores:
+            core.set_reset_catch(reset_type)
+        session.target.reset_and_halt(reset_type)
+    finally:
+        for core in secondary_cores:
+            core.clear_reset_catch(reset_type)
+
 
 WATCHPOINT_FUNCTION_NAME_MAP = {
                         Target.WatchpointType.READ: 'r',
@@ -683,7 +709,10 @@ class LoadCommand(CommandBase):
             self.addr = None
 
     def execute(self):
-        programmer = FileProgrammer(self.context.session, progress=print_progress())
+        session = self.context.session
+        _reset_before_flash_commander(session)
+
+        programmer = FileProgrammer(session, progress=print_progress())
         programmer.program(self.filename, base_address=self.addr)
 
 class CompareCommand(CommandBase):
@@ -919,14 +948,17 @@ class EraseCommand(CommandBase):
                 self.count = self._convert_value(args[1])
 
     def execute(self):
+        session = self.context.session
+        _reset_before_flash_commander(session)
+
         if self.erase_chip:
-            eraser = FlashEraser(self.context.session, FlashEraser.Mode.CHIP)
+            eraser = FlashEraser(session, FlashEraser.Mode.CHIP)
             eraser.erase()
         else:
-            eraser = FlashEraser(self.context.session, FlashEraser.Mode.SECTOR)
+            eraser = FlashEraser(session, FlashEraser.Mode.SECTOR)
             while self.count:
                 # Look up the flash region so we can get the page size.
-                region = self.context.session.target.memory_map.get_region_for_address(self.addr)
+                region = session.target.memory_map.get_region_for_address(self.addr)
                 if not region:
                     self.context.writei("address 0x%08x is not within a memory region", self.addr)
                     break
